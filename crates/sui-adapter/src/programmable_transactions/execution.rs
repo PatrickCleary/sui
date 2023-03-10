@@ -1,10 +1,14 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use move_binary_format::{
     access::ModuleAccess,
+    compatibility::Compatibility,
     errors::{Location, PartialVMResult, VMResult},
     file_format::{AbilitySet, CodeOffset, FunctionDefinitionIndex, LocalIndex, Visibility},
     CompiledModule,
@@ -32,9 +36,13 @@ use sui_types::{
     gas::SuiGasStatus,
     id::UID,
     messages::{
-        Argument, Command, CommandArgumentError, ProgrammableMoveCall, ProgrammableTransaction,
+        Argument, Command, CommandArgumentError, PackageUpgradeError, ProgrammableMoveCall,
+        ProgrammableTransaction,
     },
-    move_package::{MovePackage, UpgradeCap},
+    move_package::{
+        is_valid_package_upgrade_policy, normalize_deserialized_modules, MovePackage, UpgradeCap,
+        UpgradeReceipt, UpgradeTicket, UPGRADE_POLICY_COMPATIBLE,
+    },
     SUI_FRAMEWORK_ADDRESS,
 };
 use sui_verifier::{
@@ -392,7 +400,7 @@ fn execute_move_publish<E: fmt::Debug, S: StorageView<E>, Mode: ExecutionMode>(
     context
         .gas_status
         .charge_publish_package(module_bytes.iter().map(|v| v.len()).sum())?;
-    let modules = publish_and_verify_modules::<_, _, Mode>(context, module_bytes)?;
+    let (modules, _) = publish_and_verify_modules::<_, _, Mode>(context, module_bytes)?;
     let modules_to_init = modules
         .iter()
         .filter_map(|module| {
@@ -427,9 +435,7 @@ fn execute_move_publish<E: fmt::Debug, S: StorageView<E>, Mode: ExecutionMode>(
     }
 
     // new_package also initializes type origin table in the package object
-    let package_object = context.new_package(modules, &dependencies, None)?;
-    let package_id = package_object.id();
-    context.add_package(package_object);
+    let package_id = context.new_package(modules, &dependencies, None)?;
     for module_id in &modules_to_init {
         let return_values = execute_move_call::<_, _, Mode>(
             context,
@@ -463,10 +469,10 @@ fn execute_move_publish<E: fmt::Debug, S: StorageView<E>, Mode: ExecutionMode>(
 /// Upgrade a Move package.  Returns an `UpgradeReceipt` for the upgraded package on success.
 fn execute_move_upgrade<E: fmt::Debug, S: StorageView<E>, Mode: ExecutionMode>(
     context: &mut ExecutionContext<E, S>,
-    _module_bytes: Vec<Vec<u8>>,
-    _dep_ids: Vec<ObjectID>,
-    _current_package_id: ObjectID,
-    _upgrade_ticket_arg: Argument,
+    module_bytes: Vec<Vec<u8>>,
+    dep_ids: Vec<ObjectID>,
+    current_package_id: ObjectID,
+    upgrade_ticket_arg: Argument,
 ) -> Result<Vec<Value>, ExecutionError> {
     // Check that package upgrades are supported.
     context
@@ -474,10 +480,171 @@ fn execute_move_upgrade<E: fmt::Debug, S: StorageView<E>, Mode: ExecutionMode>(
         .check_package_upgrades_supported()
         .map_err(|_| ExecutionError::from_kind(ExecutionErrorKind::FeatureNotYetSupported))?;
 
-    invariant_violation!("Package upgrades are turned off. We should NEVER get here.")
+    assert_invariant!(
+        !module_bytes.is_empty(),
+        "empty package is checked in transaction input checker"
+    );
+
+    let upgrade_ticket: UpgradeTicket = {
+        let mut ticket_bytes = Vec::new();
+        let ticket_val: Value =
+            context.by_value_arg(CommandKind::Upgrade, 0, upgrade_ticket_arg)?;
+        let ticket_type = context
+            .session
+            .load_type(&TypeTag::Struct(Box::new(UpgradeTicket::type_())))
+            .map_err(|e| context.convert_vm_error(e))?;
+        check_param_type::<_, _, Mode>(context, 0, &ticket_val, &ticket_type)?;
+        ticket_val.write_bcs_bytes(&mut ticket_bytes);
+        bcs::from_bytes(&ticket_bytes).map_err(|_| {
+            ExecutionError::from_kind(ExecutionErrorKind::CommandArgumentError {
+                arg_idx: 0,
+                kind: CommandArgumentError::InvalidBCSBytes,
+            })
+        })?
+    };
+
+    // Make sure the passed-in package ID matches the package ID in the `upgrade_ticket`.
+    if current_package_id != upgrade_ticket.package.bytes {
+        return Err(ExecutionError::from_kind(
+            ExecutionErrorKind::PackageUpgradeError {
+                upgrade_error: PackageUpgradeError::PackageIDDoesNotMatch {
+                    package_id: current_package_id,
+                    ticket_id: upgrade_ticket.package.bytes,
+                },
+            },
+        ));
+    }
+
+    // Check digest.
+    let computed_digest =
+        MovePackage::compute_digest_for_modules_and_deps(&module_bytes, &dep_ids).to_vec();
+    if computed_digest != upgrade_ticket.digest {
+        return Err(ExecutionError::from_kind(
+            ExecutionErrorKind::PackageUpgradeError {
+                upgrade_error: PackageUpgradeError::DigestDoesNotMatch {
+                    digest: computed_digest,
+                },
+            },
+        ));
+    }
+
+    // Run the move + sui verifier on the modules and publish them into the cache.
+    // This will give use the new package ID as well that we will need when creating
+    // the linkage tables when upgrading the package.
+    let (upgraded_package_modules, new_package_id) =
+        publish_and_verify_modules::<_, _, Mode>(context, module_bytes)?;
+
+    // Check that this package ID points to a package and get the package we're upgrading.
+    let current_package = fetch_package(context, &upgrade_ticket.package.bytes)?;
+
+    // Full backwards compatibility except that we allow friend function signatures to change.
+    let check_struct_and_pub_function_linking = true;
+    let check_struct_layout = true;
+    let check_friend_linking = false;
+    check_compatibility(
+        &current_package,
+        &upgraded_package_modules,
+        upgrade_ticket.policy,
+        check_struct_and_pub_function_linking,
+        check_struct_layout,
+        check_friend_linking,
+    )?;
+
+    // Deduplicate any dependency ids.
+    let dep_ids: BTreeSet<_> = dep_ids.into_iter().collect();
+
+    // Read the package dependencies.
+    let dependency_packages = dep_ids
+        .iter()
+        .map(|id| fetch_package(context, id))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let upgraded_object_id = context.upgrade_package(
+        &current_package,
+        new_package_id,
+        upgraded_package_modules,
+        &dependency_packages,
+    )?;
+
+    let upgrade_receipt_type = context
+        .session
+        .load_type(&TypeTag::Struct(Box::new(UpgradeReceipt::type_())))
+        .map_err(|e| context.convert_vm_error(e))?;
+
+    Ok(vec![Value::Raw(
+        RawValueType::Loaded {
+            ty: upgrade_receipt_type,
+            abilities: AbilitySet::EMPTY,
+            used_in_non_entry_move_call: false,
+        },
+        bcs::to_bytes(&UpgradeReceipt::new(upgrade_ticket, upgraded_object_id)).unwrap(),
+    )])
 }
 
-#[allow(dead_code)]
+fn check_compatibility<'a>(
+    existing_package: &MovePackage,
+    upgrading_modules: impl IntoIterator<Item = &'a CompiledModule>,
+    policy: u8,
+    check_struct_and_pub_function_linking: bool,
+    check_struct_layout: bool,
+    check_friend_linking: bool,
+) -> Result<(), ExecutionError> {
+    let compatiblity_checker = Compatibility::new(
+        check_struct_and_pub_function_linking,
+        check_struct_layout,
+        check_friend_linking,
+    );
+    // Make sure this is a known upgrade policy.
+    if !is_valid_package_upgrade_policy(&policy) {
+        return Err(ExecutionError::from_kind(
+            ExecutionErrorKind::PackageUpgradeError {
+                upgrade_error: PackageUpgradeError::UnknownUpgradePolicy { policy },
+            },
+        ));
+    }
+
+    // TODO(tzakian): We currently only support compatible upgrades. Need to add in support for
+    // additive and dep-only upgrades as well.
+    if policy != UPGRADE_POLICY_COMPATIBLE {
+        return Err(ExecutionError::new_with_source(
+            ExecutionErrorKind::FeatureNotYetSupported,
+            format!("Upgrade policy {policy} not yet supported"),
+        ));
+    }
+
+    let Ok(current_normalized) = existing_package.normalize() else {
+        return Err(ExecutionError::new_with_source(
+                ExecutionErrorKind::InvariantViolation,
+                "Tried to normalize modules in existing package but failed",
+        ));
+    };
+
+    let mut new_normalized = normalize_deserialized_modules(upgrading_modules.into_iter());
+
+    for (name, cur_module) in current_normalized {
+        let Some(new_module) = new_normalized.remove(&name) else {
+            let msg = format!("Existing module {name} not found in next version of package");
+            return Err(ExecutionError::new_with_source(
+                    ExecutionErrorKind::PackageUpgradeError {
+                        upgrade_error: PackageUpgradeError::IncompatibleUpgrade
+                    },
+                    msg,
+            ));
+        };
+
+        if let Err(e) = compatiblity_checker.check(&cur_module, &new_module) {
+            return Err(ExecutionError::new_with_source(
+                ExecutionErrorKind::PackageUpgradeError {
+                    upgrade_error: PackageUpgradeError::IncompatibleUpgrade,
+                },
+                e,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn fetch_package<'a, E: fmt::Debug, S: StorageView<E>>(
     context: &'a ExecutionContext<E, S>,
     package_id: &ObjectID,
@@ -562,7 +729,7 @@ fn vm_move_call<E: fmt::Debug, S: StorageView<E>>(
 fn publish_and_verify_modules<E: fmt::Debug, S: StorageView<E>, Mode: ExecutionMode>(
     context: &mut ExecutionContext<E, S>,
     module_bytes: Vec<Vec<u8>>,
-) -> Result<Vec<CompiledModule>, ExecutionError> {
+) -> Result<(Vec<CompiledModule>, ObjectID), ExecutionError> {
     let mut modules = module_bytes
         .iter()
         .map(|b| {
@@ -612,7 +779,7 @@ fn publish_and_verify_modules<E: fmt::Debug, S: StorageView<E>, Mode: ExecutionM
         // bytecode verifier has passed.
         sui_verifier::verifier::verify_module(module, &BTreeMap::new())?;
     }
-    Ok(modules)
+    Ok((modules, package_id))
 }
 
 /***************************************************************************************************
