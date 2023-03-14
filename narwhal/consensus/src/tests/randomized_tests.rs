@@ -326,11 +326,14 @@ fn generate_and_run_execution_plans(
     let mut executed_plans = HashSet::new();
     let mut committed_certificates = Vec::new();
 
-    // Create a single store to be re-used across Bullshark instances - it is ok to re-use as things
-    // will get overwritten and we never read from the storage.
+    // Create a single store to be re-used across Bullshark instances to avoid hitting
+    // a "too many files open" issue.
     let store = make_consensus_store(&test_utils::temp_dir());
 
     for i in 0..test_iterations {
+        // clear store before using for next test
+        store.clear().unwrap();
+
         let seed = (i + 1) * run_id;
 
         let plan = create_execution_plan(original_certificates.clone(), seed);
