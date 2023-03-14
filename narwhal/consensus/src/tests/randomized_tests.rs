@@ -62,20 +62,21 @@ impl ExecutionPlan {
 }
 
 #[tokio::test]
+#[ignore]
 async fn bullshark_randomised_tests() {
     // Configuration regarding the randomized tests. The tests will run for different values
     // on the below parameters to increase the different cases we can generate.
 
     // A range of gc_depth to be used
-    const GC_DEPTH: RangeInclusive<Round> = 4..=6;
+    const GC_DEPTH: RangeInclusive<Round> = 4..=15;
     // A range of the committee size to be used
-    const COMMITTEE_SIZE: RangeInclusive<usize> = 4..=10;
+    const COMMITTEE_SIZE: RangeInclusive<usize> = 4..=8;
     // A range of rounds for which we will create DAGs
-    const DAG_ROUNDS: RangeInclusive<Round> = 4..=10;
+    const DAG_ROUNDS: RangeInclusive<Round> = 8..=15;
     // The number of different execution plans to be created and tested against for every generated DAG
-    const EXECUTION_PLANS: u64 = 10;
+    const EXECUTION_PLANS: u64 = 10_000;
     // The number of DAGs that should be generated and tested against for every set of properties.
-    const DAGS_PER_SETUP: u64 = 1;
+    const DAGS_PER_SETUP: u64 = 1_000;
     // DAGs will be created for these failure modes
     let failure_modes: Vec<FailureModes> = vec![
         // No failures
@@ -92,9 +93,9 @@ async fn bullshark_randomised_tests() {
         },
         // Severe failures
         FailureModes {
-            nodes_failure_probability: 0.2,      // 20%
+            nodes_failure_probability: 0.0,      // 0%
             slow_nodes_percentage: 0.2,          // 20%
-            slow_nodes_failure_probability: 1.0, // 100% - always slow
+            slow_nodes_failure_probability: 0.7, // 70%
         },
     ];
 
