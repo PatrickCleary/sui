@@ -381,7 +381,15 @@ fn generate_and_run_execution_plans(
         if committed_certificates.is_empty() {
             committed_certificates = plan_committed_certificates.clone();
         } else {
-            assert_eq!(committed_certificates, plan_committed_certificates);
+            assert_eq!(
+                committed_certificates,
+                plan_committed_certificates,
+                "Fork detected in plans for seed={}, rounds={}, committee={}, gc_depth={}",
+                seed,
+                dag_rounds,
+                committee.authorities.len(),
+                gc_depth
+            );
         }
 
         println!(
