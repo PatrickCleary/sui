@@ -2168,18 +2168,11 @@ pub enum ExecutionFailureStatus {
     )]
     PublishErrorNonZeroAddress,
     #[error(
-        "Publish/Upgrade Error, Missing immediate dependency. \
-         Immediate dependency of published or upgraded package has not been assigned an on-chain \
+        "Publish/Upgrade Error, Missing dependency. \
+         A dependency of a published or upgraded package has not been assigned an on-chain \
          address."
     )]
-    PublishUpgradeMissingImmediateDependency,
-
-    #[error(
-        "Publish/Upgrade Error, Missing indirect dependency. \
-         Indirect (transitive) dependency of published or upgraded package has not been assigned an \
-         on-chain address."
-    )]
-    PublishUpgradeMissingIndirectDependency,
+    PublishUpgradeMissingDependency,
 
     #[error(
         "Publish/Upgrade Error, Dependency downgrade. \

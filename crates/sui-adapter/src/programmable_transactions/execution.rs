@@ -34,7 +34,7 @@ use sui_types::{
     messages::{
         Argument, Command, CommandArgumentError, ProgrammableMoveCall, ProgrammableTransaction,
     },
-    move_package::UpgradeCap,
+    move_package::{MovePackage, UpgradeCap},
     SUI_FRAMEWORK_ADDRESS,
 };
 use sui_verifier::{
@@ -475,6 +475,40 @@ fn execute_move_upgrade<E: fmt::Debug, S: StorageView<E>, Mode: ExecutionMode>(
         .map_err(|_| ExecutionError::from_kind(ExecutionErrorKind::FeatureNotYetSupported))?;
 
     invariant_violation!("Package upgrades are turned off. We should NEVER get here.")
+}
+
+#[allow(dead_code)]
+fn fetch_package<'a, E: fmt::Debug, S: StorageView<E>>(
+    context: &'a ExecutionContext<E, S>,
+    package_id: &ObjectID,
+) -> Result<MovePackage, ExecutionError> {
+    let mut fetched_packages = fetch_packages(context, vec![package_id])?;
+    assert_invariant!(
+        fetched_packages.len() == 1,
+        "Number of fetched packages must match the number of package object IDs if successful."
+    );
+    match fetched_packages.pop() {
+        Some(pkg) => Ok(pkg),
+        None => invariant_violation!(
+            "We should always fetch a package for each object or return a dependency error."
+        ),
+    }
+}
+
+fn fetch_packages<'a, E: fmt::Debug, S: StorageView<E>>(
+    context: &'a ExecutionContext<E, S>,
+    package_ids: impl IntoIterator<Item = &'a ObjectID>,
+) -> Result<Vec<MovePackage>, ExecutionError> {
+    match context.state_view.get_packages(package_ids) {
+        Err(e) => Err(ExecutionError::new_with_source(
+            ExecutionErrorKind::PublishUpgradeMissingDependency,
+            e,
+        )),
+        Ok(None) => Err(ExecutionError::from_kind(
+            ExecutionErrorKind::PublishUpgradeMissingDependency,
+        )),
+        Ok(Some(pkgs)) => Ok(pkgs),
+    }
 }
 
 /***************************************************************************************************
