@@ -99,7 +99,6 @@ async fn bullshark_randomised_tests() {
         },
     ];
 
-    // Run the tests for that specific committee size & gc_depth
     let mut run_id = 0;
     for committee_size in COMMITTEE_SIZE {
         for gc_depth in GC_DEPTH {
